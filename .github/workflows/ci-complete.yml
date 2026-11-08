@@ -45,7 +45,21 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       build-scan-names: ${{ steps.build-scan-names.outputs.build-scan-names }}
+      develocity-configured: ${{ steps.develocity.outputs.configured }}
     steps:
+      # fork 仓库没有 DEVELOCITY_ACCESS_KEY, 此时发布 scan 必然失败(还会把 commit status 标红)。
+      # job 级 if 无法直接读 secrets, 所以在这里先探测并作为 output 暴露给下游 job。
+      - name: Check Develocity access key
+        id: develocity
+        env:
+          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+        run: |
+          if [ -z "${DEVELOCITY_ACCESS_KEY}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DEVELOCITY_ACCESS_KEY is not configured. Build scan publishing will be skipped."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: List buildscan artifacts
         id: build-scan-names
         env:
@@ -63,7 +77,18 @@ jobs:
   upload-build-scan:
     needs: get-build-scan-names
     # Skip this workflow if the CI run was skipped or cancelled
-    if: (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
+    #
+    # 追加两个条件, 否则矩阵为空时 GitHub 会以
+    #   "Matrix vector 'build-scan-name' does not contain any values"
+    # 直接把整个 workflow 判负(实测 run 42444543042: get-build-scan-names 成功,
+    # 但矩阵 job 根本没被创建, run 结论仍为 failure):
+    #   1) Develocity 未配置(典型场景: fork 仓库无该 secret) -> 无需发布 scan
+    #   2) 上游 CI 没有产出任何 build-scan-* artifact(例如 test job 被 skip) -> 矩阵无值
+    if: |
+      (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
+      && needs.get-build-scan-names.outputs.develocity-configured == 'true'
+      && needs.get-build-scan-names.outputs.build-scan-names != ''
+      && needs.get-build-scan-names.outputs.build-scan-names != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

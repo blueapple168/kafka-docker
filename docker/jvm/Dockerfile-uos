@@ -44,18 +44,22 @@
 ARG KAFKA_VERSION=4.3.1
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 # 版本号需与清华镜像 Adoptium/25 目录下实际存在的 tarball 完全一致,
-# 否则 wget 会 404。当前镜像上提供的是 25.0.4.1_1 (见 SHA256SUMS)。
-ARG JDK_VERSION=25.0.4.1_1
-ARG JRE_VERSION=25.0.4.1_1
+# 否则 wget 会 404。当前镜像上提供的是 25.0.5_8 (见目录页 / SHA256SUMS)。
+# 注意: 该镜像会随上游发布轮转补丁版本 (25.0.4.1_1 -> 25.0.5_8 即导致过一次 CI 构建失败),
+# 因此 CI 构建时由 workflow 的 "Resolve Temurin version and checksums" 步骤动态解析并通过
+# --build-arg 覆盖下面两个 ARG; 这里的默认值只用于本地手动 docker build。
+ARG JDK_VERSION=25.0.5_8
+ARG JRE_VERSION=25.0.5_8
 
 # Adoptium OpenJDK 25 tarball 的清华镜像路径 (无 .asc 签名文件，使用 ARG SHA256 摘要校验)
-# 摘要由仓库 Secrets 注入 (workflow 通过 --build-arg 透传):
+# 摘要由 CI 自动解析后注入 (workflow "Resolve Temurin version and checksums" 通过 --build-arg 透传),
+# 仓库 Secrets 仅作兜底:
 #   JDK_TARBALL_SHA256_X86_64 / JDK_TARBALL_SHA256_AARCH64
 #   JRE_TARBALL_SHA256_X86_64 / JRE_TARBALL_SHA256_AARCH64
-# 升级 JDK_VERSION / JRE_VERSION 时需同步更新四个 secrets
-# 取自清华镜像目录下方的 SHA256SUMS 或 Adoptium release notes:
+# 升级 JDK_VERSION / JRE_VERSION 时, CI 会自动跟随镜像实际版本, 无需手工同步摘要
+# 摘要取自 Adoptium 官方 API (v3/assets/release_name) 或 release notes:
+#   https://api.adoptium.net/v3/assets/release_name/eclipse/jdk-<version with +>
 #   ${JAVA_MIRROR_BASE_URL}/${JDK_SUBDIR}/<arch>/linux/...
-#   ${JAVA_MIRROR_BASE_URL}/${JRE_SUBDIR}/<arch>/linux/...
 ARG JDK_TARBALL_SHA256_X86_64=""
 ARG JDK_TARBALL_SHA256_AARCH64=""
 ARG JRE_TARBALL_SHA256_X86_64=""
@@ -137,10 +141,17 @@ RUN set -eux; \
     \
     : "=== wget --progress dot:giga 下载 tarball (带 5 次重试, 境外链路易断) ===" ; \
     wget --progress dot:giga --tries=5 --timeout=300 --waitretry=10 --retry-connrefused \
-         --output-document "/tmp/${JDK_TARBALL_NAME}" "$JDK_TARBALL_URL"; \
+         --output-document "/tmp/${JDK_TARBALL_NAME}" "$JDK_TARBALL_URL" \
+      || { echo >&2 "error: Temurin JDK 下载失败: ${JDK_TARBALL_URL}"; \
+           echo >&2 "hint: 镜像可能已轮转到新补丁版本, 请更新 JDK_VERSION 或让 CI 自动解析"; exit 1; }; \
     \
-    : "=== SHA256 校验: 摘要取自清华镜像目录的 SHA256SUMS (无 .asc 资产,这是官方提供的唯一校验手段) ===" ; \
-    echo "${jdkSha}  /tmp/${JDK_TARBALL_NAME}" | sha256sum --check --strict -; \
+    : "=== SHA256 校验: 摘要取自 Adoptium 官方 (无 .asc 资产,这是官方提供的唯一校验手段) ===" ; \
+    : "摘要为空时(未配置 Secrets 且 CI 未解析)只告警不中断, 便于本地手动构建" ; \
+    if [ -n "${jdkSha}" ]; then \
+        echo "${jdkSha}  /tmp/${JDK_TARBALL_NAME}" | sha256sum --check --strict -; \
+    else \
+        echo >&2 "warning: 未提供 JDK_TARBALL_SHA256, 跳过校验"; \
+    fi; \
     \
     : "=== 解压 Temurin JDK 到 /usr/lib/jvm,探测顶层目录名 ===" ; \
     mkdir -p "$JDK_INSTALL_DIR"; \
@@ -300,8 +311,14 @@ RUN set -eux; \
     JAVA_HOME="/usr/lib/jvm/java"; \
     \
     wget --progress dot:giga --tries=5 --timeout=300 --waitretry=10 --retry-connrefused \
-         --output-document "/tmp/${JRE_TARBALL_NAME}" "$JRE_TARBALL_URL"; \
-    echo "${jreSha}  /tmp/${JRE_TARBALL_NAME}" | sha256sum --check --strict -; \
+         --output-document "/tmp/${JRE_TARBALL_NAME}" "$JRE_TARBALL_URL" \
+      || { echo >&2 "error: Temurin JRE 下载失败: ${JRE_TARBALL_URL}"; \
+           echo >&2 "hint: 镜像可能已轮转到新补丁版本, 请更新 JRE_VERSION 或让 CI 自动解析"; exit 1; }; \
+    if [ -n "${jreSha}" ]; then \
+        echo "${jreSha}  /tmp/${JRE_TARBALL_NAME}" | sha256sum --check --strict -; \
+    else \
+        echo >&2 "warning: 未提供 JRE_TARBALL_SHA256, 跳过校验"; \
+    fi; \
     \
     mkdir -p "$JDK_INSTALL_DIR"; \
     JRE_DIR=$(tar -tzf "/tmp/${JRE_TARBALL_NAME}" | head -n1 | cut -d/ -f1); \

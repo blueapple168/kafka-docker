@@ -70,7 +70,25 @@ jobs:
         with:
           persist-credentials: false
 
+      # "test-catalog" 是上游 apache/kafka 长期维护的独立分支, 用于存放 flaky/new 测试目录。
+      # fork 或新建的仓库没有该分支, 下面 `ref: 'test-catalog'` 的 checkout 会直接失败
+      # (/usr/bin/git exit code 1), 进而:
+      #   load-catalog 失败 -> test job 被 skip -> "CI checks completed" 判负 -> 整个 CI 报红。
+      # 因此先探测分支是否存在, 不存在就跳过 catalog 相关步骤 —— 测试照常执行。
+      # 没有 catalog 时行为安全: CatalogTestFilter.create() 对缺失文件返回 EXCLUDE_ALL_TESTS,
+      # 主套件(flaky=false,new=false)因此全量执行, run-new 变体空跑, 不会误判失败。
+      - name: Detect test-catalog branch
+        id: detect-catalog
+        run: |
+          if git ls-remote --exit-code --heads origin test-catalog > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Branch 'test-catalog' not found in this repository. Skipping test catalog loading; tests will run without a catalog."
+          fi
+
       - name: Checkout test-catalog
+        if: steps.detect-catalog.outputs.exists == 'true'
         uses: actions/checkout@v5
         with:
           ref: 'test-catalog'
@@ -79,7 +97,7 @@ jobs:
           path: test-catalog
 
       - name: Checkout catalog at earlier date
-        if: ${{ needs.configure.outputs.test-catalog-days != '0' }}
+        if: ${{ steps.detect-catalog.outputs.exists == 'true' && needs.configure.outputs.test-catalog-days != '0' }}
         env:
           DAYS: ${{ needs.configure.outputs.test-catalog-days }}
         run: |
@@ -96,6 +114,7 @@ jobs:
       # we do not fail as this will fail the overall workflow.
       - name: Combine Catalog into single file
         id: combine-catalog
+        if: steps.detect-catalog.outputs.exists == 'true'
         continue-on-error: true
         run: |
           python .github/scripts/format-test-catalog.py --path "test-catalog/test-catalog/**/*.yaml"
@@ -370,10 +389,14 @@ jobs:
 
   # This job downloads the test catalog from the previous job and overlays it on the test-catalog branch.
   # This will only run on trunk and only if the collate job did not detect a timeout.
+  #
+  # 追加 `!github.event.repository.fork`: test-catalog 分支只存在于上游 apache/kafka。
+  # fork 仓库没有该分支时, 下面的 `ref: test-catalog` checkout 必然失败, 而本 job 又在
+  # trunk push 时无条件运行, 会把整个 CI 拖红(且推送目标是 apache/kafka, 对 fork 无意义)。
   update-test-catalog:
     name: Update Test Catalog
     needs: collate-test-catalog
-    if: ${{ inputs.is-trunk && needs.collate-test-catalog.outputs.uploaded-test-catalog == 'true' }}
+    if: ${{ inputs.is-trunk && !github.event.repository.fork && needs.collate-test-catalog.outputs.uploaded-test-catalog == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
