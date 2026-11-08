@@ -34,6 +34,10 @@
 #   上游轮转补丁版本时无需再人工同步 Dockerfile ARG 与 Secrets。
 #
 # 推送目标: ghcr.io/blueapple168/kafka:<image_tag> (linux/amd64, linux/arm64)
+#
+# 发布完成后由 update-readme job 自动更新 README.md 的「已发布镜像」表
+# (位于 <!-- IMAGE-TAGS:BEGIN --> 与 <!-- IMAGE-TAGS:END --> 之间),
+# 因此每次发版构建镜像都会同步文档, 无需手工维护版本清单。
 
 name: Docker Build and Publish (UOS)
 
@@ -436,3 +440,134 @@ jobs:
             "${repo}:${image_tag}-arm64"
           echo "::notice::multi-arch manifest published: ${repo}:${image_tag}"
           docker buildx imagetools inspect "${repo}:${image_tag}"
+
+  # 镜像发布成功后, 自动把新版本写进 README.md 的镜像清单。
+  #
+  # 约定: 每次发布新版本构建镜像时, README 的「已发布镜像」表必须同步。
+  # 手工维护易漏, 因此由流水线在 manifest 合成成功后写入 (表格位于
+  # <!-- IMAGE-TAGS:BEGIN --> 与 <!-- IMAGE-TAGS:END --> 之间, 由
+  # .github/scripts/update-readme.py 生成, 幂等)。
+  #
+  # 用 GITHUB_TOKEN 提交推送不会触发新的工作流运行 (GitHub 的防递归规则),
+  # 提交信息再带 [skip ci] 作为双保险; 且 README.md 不在本 workflow 的
+  # paths 过滤内, 不会自触发。
+  update-readme:
+    name: Update README image table
+    needs: [build-and-publish, merge-manifest]
+    if: |
+      always()
+      && github.repository_id == '1412943752'
+      && github.ref == 'refs/heads/trunk'
+      && needs.build-and-publish.result == 'success'
+      && needs.merge-manifest.result == 'success'
+    runs-on: ubuntu-latest
+    # 文档同步失败不应把"镜像已发布成功"的结论判负, 因此不阻断整体结果;
+    # 失败会以 job 状态与 step summary 呈现, 便于事后补录 (见 README 5.4)。
+    continue-on-error: true
+    permissions:
+      contents: write
+    env:
+      KAFKA_VERSION: '4.3.1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: trunk
+          persist-credentials: true  # 后续需要 commit + push
+
+      # 直接从 ghcr 的 registry API 读取 tag 的 manifest list:
+      #   - digest 取自响应头 docker-content-digest (manifest list 自身的摘要)
+      #   - 平台列表取自 manifest list 的 manifests[].platform.architecture
+      # 比解析 docker buildx 的格式化输出更稳定, 且公共包无需登录。
+      - name: Collect image metadata
+        id: collect
+        run: |
+          set -euo pipefail
+          registry='ghcr.io'
+          repo_path='blueapple168/kafka'
+          accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+
+          token=$(curl -fsSL --retry 3 --max-time 30 \
+                    "https://${registry}/token?scope=repository:${repo_path}:pull&service=${registry}" \
+                  | jq -r '.token // empty')
+          if [ -z "${token}" ]; then
+            echo "::error::无法从 ${registry} 获取匿名 pull token"
+            exit 1
+          fi
+
+          built_at=$(date -u +'%Y-%m-%d %H:%M')
+          rows='[]'
+          for variant in jvm native; do
+            if [ "${variant}" = 'native' ]; then
+              tag="${KAFKA_VERSION}-native-uos"
+            else
+              tag="${KAFKA_VERSION}-uos"
+            fi
+
+            body=$(curl -fsSL --retry 3 --max-time 30 \
+                     -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
+                     "https://${registry}/v2/${repo_path}/manifests/${tag}" || true)
+            digest=$(curl -fsSLI --retry 3 --max-time 30 \
+                       -H "Authorization: Bearer ${token}" -H "Accept: ${accept}" \
+                       "https://${registry}/v2/${repo_path}/manifests/${tag}" 2>/dev/null \
+                     | tr -d '\r' \
+                     | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tail -n1 || true)
+
+            if [ -z "${body}" ] || [ -z "${digest}" ]; then
+              echo "::warning::${registry}/${repo_path}:${tag} 不可读 (可能该平台构建未完成), 跳过 README 记录"
+              continue
+            fi
+
+            platforms=$(printf '%s' "${body}" \
+              | jq -r '[.manifests[]?.platform.architecture // empty]
+                       | map(select(. == "amd64" or . == "arm64"))
+                       | map("linux/" + .) | unique | join(", ")')
+
+            echo "::notice::${tag} digest=${digest} platforms=${platforms:-<none>}"
+            rows=$(jq -c \
+              --arg tag "${tag}" \
+              --arg variant "${variant}" \
+              --arg platforms "${platforms:-linux/amd64, linux/arm64}" \
+              --arg digest "${digest}" \
+              --arg built "${built_at}" \
+              '. + [{tag: $tag, variant: $variant, platforms: $platforms, digest: $digest, built_at: $built}]' \
+              <<< "${rows}")
+          done
+
+          jq -n --arg ver "${KAFKA_VERSION}" --argjson rows "${rows}" \
+            '{kafka_version: $ver, rows: $rows}' > image-rows.json
+          cat image-rows.json
+          {
+            echo "### README 镜像清单待写入数据"
+            echo '```json'
+            cat image-rows.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update README
+        run: python3 .github/scripts/update-readme.py --data image-rows.json
+
+      - name: Commit and push README
+        run: |
+          set -euo pipefail
+          rm -f image-rows.json
+          if git diff --quiet -- README.md; then
+            echo "::notice::README 无变化, 跳过提交"
+            exit 0
+          fi
+
+          git diff -- README.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          git commit -m "docs(readme): 更新 ${KAFKA_VERSION} 镜像清单 [skip ci]"
+
+          # 并发场景下 trunk 可能已前进, 失败后 rebase 重试一次
+          if git push; then
+            echo "::notice::README 已推送"
+            exit 0
+          fi
+          echo "::warning::首次推送失败, rebase 后重试"
+          git pull --rebase --autostash origin trunk
+          git push
+          echo "::notice::README 已推送 (重试成功)"
